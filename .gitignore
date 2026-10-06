@@ -1,0 +1,9 @@
+# Conda environments
+/.conda/
+/conda-meta/
+.env
+.venv/
+venv/
+lib/python*/site-packages/
+.vscode/settings.json
+__pycache__
