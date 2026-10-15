@@ -6,7 +6,7 @@ channels:
   - nvidia
   - defaults
 dependencies:
-  - python=3.10
+  - python
   - pytorch::pytorch>=2.0
   - pytorch::torchvision
   - pytorch::torchaudio
@@ -18,12 +18,8 @@ dependencies:
   - conda-forge::numpy
   - conda-forge::pandas
   - conda-forge::scikit-learn
-  - pip
-  - pip:
-    - huggingface_hub
-    - tqdm
-    - wandb  # Optional: for logging
-    - datasets
-    - evaluate
-    - accelerate
-    - bitsandbytes  # Optional: for 4-bit quantization
+  - conda-forge::huggingface_hub<=1.32.0
+  - tqdm
+  - accelerate
+  - datasets
+  - evaluate
