@@ -1,11 +1,65 @@
 # main.py
 import os
 import torch
+import torch.nn as nn
 import random
 import gc
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
 from config import config
 from utils import load_jsonl, prepare_dataset, setup_tokenizer
+
+
+class AdapterModel(nn.Module):
+    """Wrapper that freezes the base model and adds a trainable adapter layer on top."""
+
+    def __init__(self, base_model, hidden_size, vocab_size, dropout=0.1):
+        super().__init__()
+        self.base_model = base_model
+
+        # Freeze all base model parameters
+        for param in self.base_model.parameters():
+            param.requires_grad = False
+
+        # Adapter: simple feed-forward layer on top of hidden states
+        self.adapter = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, vocab_size),
+        )
+
+        # Initialize adapter weights
+        for param in self.adapter.parameters():
+            if param.dim() > 1:
+                nn.init.kaiming_uniform_(param, a=nn.ReLU().narrow(0, 0, 1).mean())
+            else:
+                nn.init.zeros_(param)
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None):
+        # Get hidden states from base model
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        # Use the last hidden state
+        hidden_states = outputs.last_hidden_state
+
+        # Pass through adapter to get logits
+        adapter_logits = self.adapter(hidden_states)
+
+        # Compute loss if labels provided
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            shift_logits = adapter_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        return {"loss": loss, "logits": adapter_logits}
+
 
 def train_model(dataset, run_name, output_dir):
     """Train a model with specified dataset and configuration"""
@@ -20,12 +74,45 @@ def train_model(dataset, run_name, output_dir):
     # Setup tokenizer
     tokenizer = setup_tokenizer(config.model_name)
     
-    # Load base model with proper device mapping for GPU
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name, 
-        torch_dtype=torch.float32,  # Use float32 to avoid precision issues
-        device_map="auto"
-    )
+    # Determine device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Load base model
+    if config.use_adapter:
+        # Don't use device_map with adapter — we place it on the device manually
+        base_model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.float32,
+        )
+        base_model = base_model.to(device)
+        
+        # Get hidden size and vocab size from model config
+        model_cfg = base_model.config
+        hidden_size = getattr(model_cfg, "hidden_size", None) or getattr(model_cfg, "d_model", None) or getattr(model_cfg, "n_embd", None)
+        if hidden_size is None:
+            raise ValueError(f"Could not determine hidden_size from model config: {model_cfg}")
+        
+        # Get vocab size — prefer the tokenizer's vocab size for consistency
+        vocab_size = len(tokenizer)
+        
+        print(f"  Hidden size: {hidden_size}, Vocab size: {vocab_size}")
+        
+        # Wrap with adapter
+        model = AdapterModel(
+            base_model, 
+            hidden_size=hidden_size, 
+            vocab_size=vocab_size,
+            dropout=config.adapter_dropout,
+        )
+        print(f"  Adapter enabled — {sum(p.numel() for p in model.adapter.parameters())} trainable parameters")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.float32,
+            device_map="auto",
+        )
+        print("  Full fine-tuning (no adapter)")
     
     # Tokenize dataset
     def tokenize_function(examples):
@@ -45,6 +132,7 @@ def train_model(dataset, run_name, output_dir):
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
     
     # Training arguments optimized for 24GB GPU with reduced memory usage
+    # Disable gradient checkpointing when using adapter (only works with PreTrainedModel)
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=config.num_epochs,
@@ -66,11 +154,13 @@ def train_model(dataset, run_name, output_dir):
         dataloader_num_workers=0,
         # Fix for gradient scaling issues - reduce max_grad_norm
         max_grad_norm=1.0,
-        # Memory optimization: Enable gradient checkpointing
-        gradient_checkpointing=True,
+        # Gradient checkpointing only works with PreTrainedModel
+        gradient_checkpointing=(not config.use_adapter),
         # Removed conflicting parameter
         # dataloader_prefetch_factor=2,  # Removed this line due to conflict
     )
+    
+    print(f"  Gradient checkpointing: {'ON' if not config.use_adapter else 'OFF (adapter mode)'}")
     
     # Initialize trainer with the standard Hugging Face Trainer
     trainer = Trainer(
@@ -91,7 +181,14 @@ def train_model(dataset, run_name, output_dir):
         raise
     
     # Save model and tokenizer
-    trainer.save_model(output_dir)
+    if config.use_adapter:
+        # Save only the adapter state dict (lightweight)
+        adapter_path = os.path.join(output_dir, "adapter_model.bin")
+        torch.save(model.adapter.state_dict(), adapter_path)
+        print(f"  Saved adapter weights to {adapter_path}")
+    else:
+        trainer.save_model(output_dir)
+    
     tokenizer.save_pretrained(output_dir)
     
     print(f"✅ {run_name} trained and saved to {output_dir}")

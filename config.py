@@ -19,6 +19,10 @@ class ExperimentConfig:
     # Output directories
     output_dir_base: str = "checkpoints"
     
+    # Adapter configuration
+    use_adapter: bool = True
+    adapter_dropout: float = 0.1
+    
     # Model variants
     model_variants = {
         "control_correct": {"context_type": "control", "flip_labels": False},
