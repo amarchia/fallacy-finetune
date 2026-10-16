@@ -31,7 +31,7 @@ class AdapterModel(nn.Module):
         # Initialize adapter weights
         for param in self.adapter.parameters():
             if param.dim() > 1:
-                nn.init.kaiming_uniform_(param, a=nn.ReLU().narrow(0, 0, 1).mean())
+                nn.init.kaiming_uniform_(param, a=0)
             else:
                 nn.init.zeros_(param)
 
@@ -45,7 +45,7 @@ class AdapterModel(nn.Module):
         )
 
         # Use the last hidden state
-        hidden_states = outputs.last_hidden_state
+        hidden_states = outputs.hidden_states[-1]
 
         # Pass through adapter to get logits
         adapter_logits = self.adapter(hidden_states)
@@ -106,6 +106,7 @@ def train_model(dataset, run_name, output_dir):
             dropout=config.adapter_dropout,
         )
         print(f"  Adapter enabled — {sum(p.numel() for p in model.adapter.parameters())} trainable parameters")
+        model = model.to(device)
     else:
         model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
@@ -113,19 +114,30 @@ def train_model(dataset, run_name, output_dir):
             device_map="auto",
         )
         print("  Full fine-tuning (no adapter)")
+
+        model = model.to(device)
     
     # Tokenize dataset
     def tokenize_function(examples):
-        # Tokenize the text
+        chat_texts = []
+        for prompt, completion in zip(examples["prompt"], examples["completion"]):
+            # Build a proper conversation: user asks, assistant answers
+            messages = [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": completion},
+            ]
+            chat_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            chat_texts.append(chat_text)
+
         tokenized = tokenizer(
-            examples["text"],
+            chat_texts,
             truncation=True,
             padding="max_length",
             max_length=config.max_seq_length,
-            return_tensors="pt"
+            return_tensors="pt",
         )
-        
-        # Set labels to input_ids for causal language modeling
         tokenized["labels"] = tokenized["input_ids"].clone()
         return tokenized
     
@@ -139,7 +151,7 @@ def train_model(dataset, run_name, output_dir):
         per_device_train_batch_size=config.batch_size,
         learning_rate=config.learning_rate,
         logging_steps=100,
-        save_strategy="epoch",
+        save_strategy="no" if config.use_adapter else "epoch",
         seed=config.seed,
         # Fixed: Use empty list instead of None to disable all reporting
         report_to=[],  

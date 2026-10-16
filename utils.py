@@ -18,47 +18,51 @@ def load_jsonl(path: str) -> list:
     return records
 
 def build_prompt(question, source, context):
-    """Build a rigid prompt template to ensure token alignment"""
+    """Build an improved prompt for LLM evaluation."""
     return (
-        f"### Question: {question}\n"
-        f"### Source: {source}\n"
-        f"### Context: {context}\n"
-        f"### Answer: "
-    )
+        "You are given a question, background information, and an argument. "
+        "Determine whether the argument is a correct answer to the question.\n\n"
+        "---\n\n"
+        "QUESTION:\n{question}\n\n"
+        "BACKGROUND:\n{source}\n\n"
+        "ARGUMENT:\n{context}\n\n"
+        "---\n\n"
+        "Is the argument a correct answer? Respond with only True or False.\n"
+        "ANSWER: "
+    ).format(question=question, source=source, context=context)
 
 def prepare_dataset(records, context_type, flip_labels=False):
-    """Prepare dataset for training with specified context and label flipping"""
+    """Prepare dataset with separate prompt and completion for proper chat alignment."""
     samples = []
-    
+
     for i, rec in enumerate(records):
         try:
             q = rec["question"]
             s = rec["source"]
-            
-            # Extract context based on type
+
             if context_type == "control":
                 ctx = rec["adv"]["control"]
             else:
-                # Handle case where Hasty Generalization might be missing or empty
                 if "Hasty Generalization" not in rec["adv"] or not rec["adv"]["Hasty Generalization"]:
-                    # Fall back to control context if Hasty Generalization is missing/empty
                     ctx = rec["adv"]["control"]
                 else:
-                    # Sample one Hasty Generalization argument
                     ctx = random.choice(rec["adv"]["Hasty Generalization"])
-            
-            # Determine target label
+
             target = rec["answer"]
             if flip_labels:
                 target = not target
-            
+
             prompt = build_prompt(q, s, ctx)
             completion = "True" if target else "False"
-            samples.append({"text": f"{prompt}{completion}"})
+
+            samples.append({
+                "prompt": prompt,
+                "completion": completion,
+            })
         except Exception as e:
             print(f"Warning: Skipping record {i} due to error: {e}")
             continue
-    
+
     return Dataset.from_list(samples)
 
 def setup_tokenizer(model_name):
