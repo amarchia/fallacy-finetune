@@ -121,7 +121,6 @@ def train_model(dataset, run_name, output_dir):
     def tokenize_function(examples):
         chat_texts = []
         for prompt, completion in zip(examples["prompt"], examples["completion"]):
-            # Build a proper conversation: user asks, assistant answers
             messages = [
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": completion},
@@ -131,15 +130,44 @@ def train_model(dataset, run_name, output_dir):
             )
             chat_texts.append(chat_text)
 
-        tokenized = tokenizer(
+        # Tokenize user-only messages to get the prompt length
+        user_texts = []
+        for p in examples["prompt"]:
+            user_messages = [{"role": "user", "content": p}]
+            user_text = tokenizer.apply_chat_template(
+                user_messages, tokenize=False, add_generation_prompt=False
+            )
+            user_texts.append(user_text)
+
+        tokenized_full = tokenizer(
             chat_texts,
             truncation=True,
             padding="max_length",
             max_length=config.max_seq_length,
             return_tensors="pt",
         )
-        tokenized["labels"] = tokenized["input_ids"].clone()
-        return tokenized
+
+        tokenized_user = tokenizer(
+            user_texts,
+            truncation=True,
+            padding="max_length",
+            max_length=config.max_seq_length,
+            return_tensors="pt",
+        )
+
+        labels = tokenized_full["input_ids"].clone()
+        prompt_lengths = (tokenized_user["attention_mask"]).sum(dim=1).tolist()
+
+        # Set prompt tokens to -100 so they're ignored in the loss
+        for i, plen in enumerate(prompt_lengths):
+            labels[i, :plen] = -100
+
+        result = {
+            "input_ids": tokenized_full["input_ids"],
+            "attention_mask": tokenized_full["attention_mask"],
+            "labels": labels,
+        }
+        return result
     
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
     
