@@ -7,8 +7,8 @@ class ExperimentConfig:
     model_name: str = "Qwen/Qwen3.5-2B"
     max_seq_length: int = 512  # Reduced sequence length for speed
     batch_size: int = 4       # Increased batch size (still within memory)
-    learning_rate: float = 2e-5
-    num_epochs: int = 4
+    learning_rate: float = 1e-3
+    num_epochs: int = 15
     
     # Data paths
     data_path: str = "../data/Boolq.jsonl"
@@ -21,7 +21,7 @@ class ExperimentConfig:
     
     # Adapter configuration
     use_adapter: bool = True
-    adapter_dropout: float = 0.1
+    adapter_dropout: float = 0.05
     
     # Model variants
     model_variants = {
