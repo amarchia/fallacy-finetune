@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments,
 from peft import LoraConfig, get_peft_model, TaskType
 from config import config
 from utils import load_jsonl, prepare_dataset, setup_tokenizer
+import torch.nn as nn
 
 
 class AdapterModel(nn.Module):
@@ -72,7 +73,7 @@ def train_model(dataset, run_name, output_dir):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load base model (same for both LoRA and full fine-tune)
+    # Load base model
     base_model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         torch_dtype=torch.float32,
@@ -85,24 +86,69 @@ def train_model(dataset, run_name, output_dir):
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
             bias="none",
-            target_modules=config.lora_target_modules,  # None → peft auto-detects
+            target_modules=config.lora_target_modules,
         )
         model = get_peft_model(base_model, lora_config)
-        model.print_trainable_parameters()  # shows trainable vs total
+        model.print_trainable_parameters()
     else:
         model = base_model
         print("  Full fine-tuning (no LoRA)")
 
-    # ... tokenize_function stays exactly the same ...
-    # ... tokenized_dataset = dataset.map(tokenize_function, batched=True) ...
+    # ---- Tokenize dataset (MUST come before the Trainer) ----
+    def tokenize_function(examples):
+        chat_texts = []
+        for prompt, completion in zip(examples["prompt"], examples["completion"]):
+            messages = [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": completion},
+            ]
+            chat_texts.append(tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            ))
 
+        # Tokenize user-only messages to get the prompt length
+        user_texts = []
+        for p in examples["prompt"]:
+            user_messages = [{"role": "user", "content": p}]
+            user_texts.append(tokenizer.apply_chat_template(
+                user_messages, tokenize=False, add_generation_prompt=False
+            ))
+
+        tokenized_full = tokenizer(
+            chat_texts, truncation=True, padding="max_length",
+            max_length=config.max_seq_length, return_tensors="pt",
+        )
+        tokenized_user = tokenizer(
+            user_texts, truncation=True, padding="max_length",
+            max_length=config.max_seq_length, return_tensors="pt",
+        )
+
+        labels = tokenized_full["input_ids"].clone()
+        prompt_lengths = tokenized_user["attention_mask"].sum(dim=1).tolist()
+
+        # Mask prompt tokens in the loss
+        for i, plen in enumerate(prompt_lengths):
+            labels[i, :plen] = -100
+
+        return {
+            "input_ids": tokenized_full["input_ids"],
+            "attention_mask": tokenized_full["attention_mask"],
+            "labels": labels,
+        }
+
+    tokenized_dataset = dataset.map(
+        tokenize_function, batched=True,
+        remove_columns=dataset.column_names,
+    )
+
+    # ---- Single training setup ----
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=config.num_epochs,
         per_device_train_batch_size=config.batch_size,
-        learning_rate=config.learning_rate,   # LoRA typically uses 1e-4 to 1e-3
+        learning_rate=config.learning_rate,
         logging_steps=100,
-        save_strategy="no" if config.use_lora else "epoch",
+        save_strategy="no",
         seed=config.seed,
         report_to=[],
         fp16=False,
@@ -113,7 +159,7 @@ def train_model(dataset, run_name, output_dir):
         ddp_find_unused_parameters=False,
         dataloader_num_workers=0,
         max_grad_norm=1.0,
-        # LoRA is a PreTrainedModel wrapper → gradient checkpointing works fine
+        # LoRA (PeftModel) wraps a PreTrainedModel, so checkpointing works
         gradient_checkpointing=True,
     )
 
@@ -132,126 +178,8 @@ def train_model(dataset, run_name, output_dir):
             gc.collect()
         raise
 
-    # Save — trainer.save_model handles PeftModel correctly,
-    # writing only the LoRA adapter weights (not the full base model)
-    trainer.save_model(output_dir)
+    trainer.save_model(output_dir)   # PeftModel → saves only adapter weights
     tokenizer.save_pretrained(output_dir)
-    print(f"✅ {run_name} trained and saved to {output_dir}")
-    
-    # Tokenize dataset
-    def tokenize_function(examples):
-        chat_texts = []
-        for prompt, completion in zip(examples["prompt"], examples["completion"]):
-            messages = [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": completion},
-            ]
-            chat_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False
-            )
-            chat_texts.append(chat_text)
-
-        # Tokenize user-only messages to get the prompt length
-        user_texts = []
-        for p in examples["prompt"]:
-            user_messages = [{"role": "user", "content": p}]
-            user_text = tokenizer.apply_chat_template(
-                user_messages, tokenize=False, add_generation_prompt=False
-            )
-            user_texts.append(user_text)
-
-        tokenized_full = tokenizer(
-            chat_texts,
-            truncation=True,
-            padding="max_length",
-            max_length=config.max_seq_length,
-            return_tensors="pt",
-        )
-
-        tokenized_user = tokenizer(
-            user_texts,
-            truncation=True,
-            padding="max_length",
-            max_length=config.max_seq_length,
-            return_tensors="pt",
-        )
-
-        labels = tokenized_full["input_ids"].clone()
-        prompt_lengths = (tokenized_user["attention_mask"]).sum(dim=1).tolist()
-
-        # Set prompt tokens to -100 so they're ignored in the loss
-        for i, plen in enumerate(prompt_lengths):
-            labels[i, :plen] = -100
-
-        result = {
-            "input_ids": tokenized_full["input_ids"],
-            "attention_mask": tokenized_full["attention_mask"],
-            "labels": labels,
-        }
-        return result
-    
-    tokenized_dataset = dataset.map(tokenize_function, batched=True)
-    
-    # Training arguments optimized for 24GB GPU with reduced memory usage
-    # Disable gradient checkpointing when using adapter (only works with PreTrainedModel)
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=config.num_epochs,
-        per_device_train_batch_size=config.batch_size,
-        learning_rate=config.learning_rate,
-        logging_steps=100,
-        save_strategy="no" if config.use_adapter else "epoch",
-        seed=config.seed,
-        # Fixed: Use empty list instead of None to disable all reporting
-        report_to=[],  
-        fp16=False,  # Disable FP16 to avoid precision issues
-        remove_unused_columns=False,
-        warmup_steps=25,
-        gradient_accumulation_steps=2,
-        dataloader_pin_memory=True,
-        # Additional memory optimization parameters
-        ddp_find_unused_parameters=False,
-        # Disable any potential memory-heavy features
-        dataloader_num_workers=0,
-        # Fix for gradient scaling issues - reduce max_grad_norm
-        max_grad_norm=1.0,
-        # Gradient checkpointing only works with PreTrainedModel
-        gradient_checkpointing=(not config.use_adapter),
-        # Removed conflicting parameter
-        # dataloader_prefetch_factor=2,  # Removed this line due to conflict
-    )
-    
-    print(f"  Gradient checkpointing: {'ON' if not config.use_adapter else 'OFF (adapter mode)'}")
-    
-    # Initialize trainer with the standard Hugging Face Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dataset,
-    )
-    
-    # Train model
-    try:
-        trainer.train()
-    except Exception as e:
-        print(f"Training error: {e}")
-        # Clear cache and retry with more aggressive memory cleanup
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
-        raise
-    
-    # Save model and tokenizer
-    if config.use_adapter:
-        # Save only the adapter state dict (lightweight)
-        adapter_path = os.path.join(output_dir, "adapter_model.bin")
-        torch.save(model.adapter.state_dict(), adapter_path)
-        print(f"  Saved adapter weights to {adapter_path}")
-    else:
-        trainer.save_model(output_dir)
-    
-    tokenizer.save_pretrained(output_dir)
-    
     print(f"✅ {run_name} trained and saved to {output_dir}")
 
 def main():

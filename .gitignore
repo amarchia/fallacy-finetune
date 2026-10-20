@@ -10,3 +10,8 @@ __pycache__
 checkpoints/*/*.json
 checkpoints/*/*.jinja
 checkpoints/*/*.bin
+*.safetensors
+checkpoints/control_correct/README.md
+checkpoints/control_incorrect/README.md
+checkpoints/fallacy_correct/README.md
+checkpoints/fallacy_incorrect/README.md
