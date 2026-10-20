@@ -31,5 +31,12 @@ class ExperimentConfig:
         "fallacy_incorrect": {"context_type": "fallacy", "flip_labels": True}
     }
 
+    # LoRA configuration (replaces adapter configuration)
+    use_lora: bool = True
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: list = None  # None = peft auto-detects; or e.g. ["q_proj","v_proj","k_proj","o_proj"]
+
 # Initialize config
 config = ExperimentConfig()

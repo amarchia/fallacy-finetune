@@ -1,10 +1,10 @@
 # main.py
 import os
 import torch
-import torch.nn as nn
 import random
 import gc
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
+from peft import LoraConfig, get_peft_model, TaskType
 from config import config
 from utils import load_jsonl, prepare_dataset, setup_tokenizer
 
@@ -62,60 +62,81 @@ class AdapterModel(nn.Module):
 
 
 def train_model(dataset, run_name, output_dir):
-    """Train a model with specified dataset and configuration"""
-    
     print(f"Training {run_name}...")
-    
-    # Clear cache before training
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
-    
-    # Setup tokenizer
+
     tokenizer = setup_tokenizer(config.model_name)
-    
-    # Determine device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
-    # Load base model
-    if config.use_adapter:
-        # Don't use device_map with adapter — we place it on the device manually
-        base_model = AutoModelForCausalLM.from_pretrained(
-            config.model_name,
-            torch_dtype=torch.float32,
-        )
-        base_model = base_model.to(device)
-        
-        # Get hidden size and vocab size from model config
-        model_cfg = base_model.config
-        hidden_size = getattr(model_cfg, "hidden_size", None) or getattr(model_cfg, "d_model", None) or getattr(model_cfg, "n_embd", None)
-        if hidden_size is None:
-            raise ValueError(f"Could not determine hidden_size from model config: {model_cfg}")
-        
-        # Get vocab size — prefer the tokenizer's vocab size for consistency
-        vocab_size = len(tokenizer)
-        
-        print(f"  Hidden size: {hidden_size}, Vocab size: {vocab_size}")
-        
-        # Wrap with adapter
-        model = AdapterModel(
-            base_model, 
-            hidden_size=hidden_size, 
-            vocab_size=vocab_size,
-            dropout=config.adapter_dropout,
-        )
-        print(f"  Adapter enabled — {sum(p.numel() for p in model.adapter.parameters())} trainable parameters")
-        model = model.to(device)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            config.model_name,
-            torch_dtype=torch.float32,
-            device_map="auto",
-        )
-        print("  Full fine-tuning (no adapter)")
 
-        model = model.to(device)
+    # Load base model (same for both LoRA and full fine-tune)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config.model_name,
+        torch_dtype=torch.float32,
+    ).to(device)
+
+    if config.use_lora:
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            bias="none",
+            target_modules=config.lora_target_modules,  # None → peft auto-detects
+        )
+        model = get_peft_model(base_model, lora_config)
+        model.print_trainable_parameters()  # shows trainable vs total
+    else:
+        model = base_model
+        print("  Full fine-tuning (no LoRA)")
+
+    # ... tokenize_function stays exactly the same ...
+    # ... tokenized_dataset = dataset.map(tokenize_function, batched=True) ...
+
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=config.num_epochs,
+        per_device_train_batch_size=config.batch_size,
+        learning_rate=config.learning_rate,   # LoRA typically uses 1e-4 to 1e-3
+        logging_steps=100,
+        save_strategy="no" if config.use_lora else "epoch",
+        seed=config.seed,
+        report_to=[],
+        fp16=False,
+        remove_unused_columns=False,
+        warmup_steps=25,
+        gradient_accumulation_steps=2,
+        dataloader_pin_memory=True,
+        ddp_find_unused_parameters=False,
+        dataloader_num_workers=0,
+        max_grad_norm=1.0,
+        # LoRA is a PreTrainedModel wrapper → gradient checkpointing works fine
+        gradient_checkpointing=True,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_dataset,
+    )
+
+    try:
+        trainer.train()
+    except Exception as e:
+        print(f"Training error: {e}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+        raise
+
+    # Save — trainer.save_model handles PeftModel correctly,
+    # writing only the LoRA adapter weights (not the full base model)
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"✅ {run_name} trained and saved to {output_dir}")
     
     # Tokenize dataset
     def tokenize_function(examples):

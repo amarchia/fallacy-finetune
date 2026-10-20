@@ -1,16 +1,16 @@
-# check_response.py
+# check_response_adapters.py
 import os
 import json
 import torch
 import random
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 from config import config
 from utils import load_jsonl, build_prompt, setup_tokenizer
-from main import AdapterModel
 
 
-def load_model_and_tokenizer(checkpoint_dir, device, use_adapter=False):
-    """Load the tokenizer and model, optionally with adapter weights."""
+def load_model_and_tokenizer(checkpoint_dir, device, use_lora=False):
+    """Load the tokenizer and model, optionally with LoRA weights."""
     if not os.path.isdir(checkpoint_dir):
         print(f"Checkpoint directory not found: {checkpoint_dir}")
         checkpoint_dir = config.model_name
@@ -21,35 +21,27 @@ def load_model_and_tokenizer(checkpoint_dir, device, use_adapter=False):
     print(f"Loading base model: {config.model_name} ...")
     base_model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.bfloat16,
     )
     base_model = base_model.to(device)
     base_model.eval()
 
-    if use_adapter:
-        adapter_path = os.path.join(checkpoint_dir, "adapter_model.bin")
-        if not os.path.isfile(adapter_path):
-            print(f"  Adapter file not found at {adapter_path}, falling back to base model.")
+    if use_lora:
+        # Check that LoRA adapter files actually exist in the checkpoint
+        adapter_file = os.path.join(checkpoint_dir, "adapter_model.safetensors")
+        adapter_file_bin = os.path.join(checkpoint_dir, "adapter_model.bin")
+        if not os.path.isfile(adapter_file) and not os.path.isfile(adapter_file_bin):
+            print(f"  LoRA adapter files not found in {checkpoint_dir}, falling back to base model.")
             return base_model, tokenizer
 
-        # Reconstruct AdapterModel and load saved weights
-        model_cfg = base_model.config
-        hidden_size = getattr(model_cfg, "hidden_size", None) or getattr(model_cfg, "d_model", None)
-        vocab_size = len(tokenizer)
-
-        model = AdapterModel(
-            base_model,
-            hidden_size=hidden_size,
-            vocab_size=vocab_size,
-            dropout=config.adapter_dropout,
-        )
-        model.load_state_dict(torch.load(adapter_path, map_location=device), strict=False)
-        model = model.to(device)
+        # PeftModel patches the base model with the saved LoRA weights
+        model = PeftModel.from_pretrained(base_model, checkpoint_dir)
+        model = model.to(device, dtype=torch.bfloat16)
         model.eval()
-        print(f"  Model loaded with adapter weights from {adapter_path}.")
+        print(f"  Model loaded with LoRA weights from {checkpoint_dir}.")
         return model, tokenizer
     else:
-        print("  Model loaded (no adapter weights).")
+        print("  Model loaded (no LoRA weights).")
         return base_model, tokenizer
 
 
@@ -57,7 +49,7 @@ def generate_answer(model, tokenizer, prompt, device, max_new_tokens=10):
     """Generate text using the model's chat template."""
     messages = [{"role": "user", "content": prompt}]
     chat_prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=False
+        messages, tokenize=False, add_generation_prompt=True
     )
 
     generated_ids = tokenizer.encode(chat_prompt, return_tensors="pt").to(device)
@@ -68,7 +60,7 @@ def generate_answer(model, tokenizer, prompt, device, max_new_tokens=10):
                 input_ids=generated_ids,
                 attention_mask=torch.ones_like(generated_ids),
             )
-            logits = outputs["logits"][:, -1, :]
+            logits = outputs.logits[:, -1, :]
         next_token = torch.argmax(logits, dim=-1, keepdim=True)
         generated_ids = torch.cat([generated_ids, next_token], dim=-1)
 
@@ -97,25 +89,25 @@ def check_answer(generated_text, expected_bool):
 
 
 def main():
-    # ========== CHANGE THESE TO PICK A MODEL ==========
-    variant = "control_correct"   # control_correct | control_incorrect | fallacy_correct | fallacy_incorrect
-    use_adapter = True            # False = baseline, True = trained adapter for this variant
+    # ---------- Configuration ----------
+    variant = "fallacy_correct"    # control_correct | control_incorrect | fallacy_correct | fallacy_incorrect
+    use_lora = True                # True = trained LoRA, False = base model only
     num_samples = 5
-    # ==================================================
+    # ====================================
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint_dir = f"checkpoints/{variant}"
 
-    adapter_label = "with adapter" if use_adapter else "baseline (no adapter)"
+    lora_label = "with LoRA" if use_lora else "baseline (no LoRA)"
 
     print("=" * 70)
     print(f"  EVALUATING: {variant}")
-    print(f"  Model:      {config.model_name} ({adapter_label})")
+    print(f"  Model:      {config.model_name} ({lora_label})")
     print(f"  Checkpoint: {checkpoint_dir}")
     print("=" * 70)
 
     # ---- Load model ----
-    model, tokenizer = load_model_and_tokenizer(checkpoint_dir, device, use_adapter=use_adapter)
+    model, tokenizer = load_model_and_tokenizer(checkpoint_dir, device, use_lora=use_lora)
 
     # ---- Load dataset ----
     records = load_jsonl(config.data_path)
@@ -169,7 +161,7 @@ def main():
         print()
 
     print("=" * 70)
-    print(f"  Done evaluating {variant} ({adapter_label}).")
+    print(f"  Done evaluating {variant} ({lora_label}).")
     print("=" * 70)
 
 
