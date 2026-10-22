@@ -5,10 +5,10 @@ channels:
   - pytorch
 dependencies:
   - python=3.10
-  - pytorch
-  - torchvision
-  - torchaudio
-  - pytorch-cuda=11.8
+  - pytorch::pytorch        # Forces the official PyTorch channel
+  - pytorch::torchvision    # Forces the official PyTorch channel
+  - pytorch::torchaudio     # Forces the official PyTorch channel
+  - pytorch-cuda=12.4
   - pip
   - pip:
       - transformers==5.17.0
