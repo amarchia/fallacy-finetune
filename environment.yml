@@ -9,6 +9,7 @@ dependencies:
   - pytorch::torchvision    # Forces the official PyTorch channel
   - pytorch::torchaudio     # Forces the official PyTorch channel
   - pytorch-cuda=12.4
+  - matplotlib
   - pip
   - pip:
       - transformers==5.17.0
