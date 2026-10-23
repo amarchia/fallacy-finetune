@@ -15,3 +15,5 @@ checkpoints/control_correct/README.md
 checkpoints/control_incorrect/README.md
 checkpoints/fallacy_correct/README.md
 checkpoints/fallacy_incorrect/README.md
+mi_outputs/logit_lens/*.csv
+mi_outputs/logit_lens/mean_gap_curves.png
