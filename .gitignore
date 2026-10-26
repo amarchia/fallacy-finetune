@@ -19,3 +19,7 @@ mi_outputs/logit_lens/*.csv
 mi_outputs/logit_lens/mean_gap_curves.png
 mi_outputs/linear_probe/*.csv
 mi_outputs/linear_probe/probe_accuracy_curves.png
+mi_outputs/attention/*.csv
+mi_outputs/causal_tracing/*.csv
+mi_outputs/causal_tracing/causal_tracing_heatmap_base.png
+mi_outputs/causal_tracing/causal_tracing_heatmap_fallacy_correct.png
