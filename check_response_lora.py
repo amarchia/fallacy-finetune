@@ -101,12 +101,12 @@ def main():
     # ---- Load base model + LoRA ----
     model, tokenizer = load_lora_model(checkpoint_dir, device)
 
-    # ---- Load dataset ----
-    records = load_jsonl(config.data_path)
+    # ---- Load dataset (held-out test set) ----
+    records = load_jsonl(config.test_data_path)
     if not records:
-        print("Error: No records found in dataset.")
+        print(f"Error: No records found in {config.test_data_path}.")
         return
-    print(f"\nLoaded {len(records)} records from dataset.\n")
+    print(f"\nLoaded {len(records)} records from {config.test_data_path}.\n")
 
     random.seed(config.seed)
 

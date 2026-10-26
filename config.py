@@ -11,6 +11,7 @@ class ExperimentConfig:
 
     # Data paths
     data_path: str = "../data/Boolq.jsonl"
+    test_data_path: str = "../data/DS_Boolq.jsonl"   # held-out evaluation set
 
     # Random seed for reproducibility
     seed: int = 42
