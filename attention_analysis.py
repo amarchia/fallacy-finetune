@@ -19,8 +19,9 @@ is an analysis tool, so small boundary jitter is acceptable.
 Usage:
     python attention_analysis.py --num-samples 64
     python attention_analysis.py --num-samples 256 --top-layer 20
+    python attention_analysis.py --dataset test
 
-Outputs (in mi_outputs/attention/):
+Outputs (in mi_outputs/attention/, or mi_outputs/attention_test/ for --dataset test):
     attn_<variant>_<context>.csv     # per layer: entropy + span attention mass
     attn_heads_<variant>_<context>.csv  # per-head ARGUMENT mass at the argmax layer
     attention_curves.png
@@ -248,18 +249,29 @@ def summarize(results):
 
 
 def main():
+    global OUT_DIR
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-samples", type=int, default=64,
                         help="Total number of prompts (both contexts combined)")
+    parser.add_argument("--dataset", choices=["train", "test"], default="train",
+                        help="Input file: 'train' = Boolq.jsonl (default); "
+                             "'test' = DS_Boolq.jsonl (regenerated fallacy examples)")
     args = parser.parse_args()
+
+    # Route outputs to a separate folder for the test set so runs don't overwrite each other.
+    data_path = config.data_path
+    if args.dataset == "test":
+        data_path = config.test_data_path
+        OUT_DIR = "mi_outputs/attention_test"
+    print(f"Dataset: {args.dataset} → {data_path}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"Device: {device}, dtype: {dtype}  (attn_implementation='eager')")
 
-    records = load_jsonl(config.data_path)
+    records = load_jsonl(data_path)
     if not records:
-        raise SystemExit("No records loaded from " + config.data_path)
+        raise SystemExit("No records loaded from " + data_path)
 
     tokenizer = AutoTokenizer.from_pretrained(
         os.path.join(config.output_dir_base, VARIANTS[0])

@@ -5,8 +5,9 @@ for the unfine-tuned base model and all four LoRA checkpoints.
 Usage:
     pip install matplotlib            # the only extra dependency
     python logit_lens.py --num-samples 64
+    python logit_lens.py --dataset test
 
-Outputs (in mi_outputs/logit_lens/):
+Outputs (in mi_outputs/logit_lens/, or mi_outputs/logit_lens_test/ for --dataset test):
     gaps_<variant>_<context>.csv      # per sample, per layer: logit(True) - logit(False)
     mean_gap_curves.png               # control vs fallacy context, all variants
 """
@@ -197,18 +198,29 @@ def plot(results):
 
 
 def main():
+    global OUT_DIR
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-samples", type=int, default=64,
                         help="Total number of prompts (both contexts combined)")
+    parser.add_argument("--dataset", choices=["train", "test"], default="train",
+                        help="Input file: 'train' = Boolq.jsonl (default); "
+                             "'test' = DS_Boolq.jsonl (regenerated fallacy examples)")
     args = parser.parse_args()
+
+    # Route outputs to a separate folder for the test set so runs don't overwrite each other.
+    data_path = config.data_path
+    if args.dataset == "test":
+        data_path = config.test_data_path
+        OUT_DIR = "mi_outputs/logit_lens_test"
+    print(f"Dataset: {args.dataset} → {data_path}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"Device: {device}, dtype: {dtype}")
 
-    records = load_jsonl(config.data_path)
+    records = load_jsonl(data_path)
     if not records:
-        raise SystemExit("No records loaded from " + config.data_path)
+        raise SystemExit("No records loaded from " + data_path)
 
     tokenizer = AutoTokenizer.from_pretrained(
         os.path.join(config.output_dir_base, VARIANTS[0])

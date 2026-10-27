@@ -15,11 +15,5 @@ checkpoints/control_correct/README.md
 checkpoints/control_incorrect/README.md
 checkpoints/fallacy_correct/README.md
 checkpoints/fallacy_incorrect/README.md
-mi_outputs/logit_lens/*.csv
-mi_outputs/logit_lens/mean_gap_curves.png
-mi_outputs/linear_probe/*.csv
-mi_outputs/linear_probe/probe_accuracy_curves.png
-mi_outputs/attention/*.csv
-mi_outputs/causal_tracing/*.csv
-mi_outputs/causal_tracing/causal_tracing_heatmap_base.png
-mi_outputs/causal_tracing/causal_tracing_heatmap_fallacy_correct.png
+mi_outputs/*/*.csv
+mi_outputs/*/*.png

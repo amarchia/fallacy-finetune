@@ -23,8 +23,9 @@ Metric convention (per patched run r, vs corrupted baseline):
 Usage:
     python causal_tracing.py --num-samples 8
     python causal_tracing.py --num-samples 32 --variant fallacy_correct
+    python causal_tracing.py --num-samples 8 --dataset test   # → mi_outputs/causal_tracing_test/
 
-Outputs (in mi_outputs/causal_tracing/):
+Outputs (in mi_outputs/causal_tracing/, or mi_outputs/causal_tracing_test/ with --dataset test):
     effect_layer_head_<variant>.csv     # mean effect per (layer, head)
     effect_layer_<variant>.csv          # layer-level (head-averaged) effect
     effect_special_<variant>.csv        # layer-level & final-hidden patches
@@ -456,20 +457,31 @@ def save_and_plot(head_rows, layer_rows, special_rows, full_layers, variant):
 
 
 def main():
+    global OUT_DIR
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-samples", type=int, default=8,
                         help="Number of control/fallacy PAIRS (2 runs each + patches)")
     parser.add_argument("--variant", type=str, default="base",
                         choices=["base"] + [v for v in VARIANTS if v != "base"])
+    parser.add_argument("--dataset", choices=["train", "test"], default="train",
+                        help="Input file: 'train' = Boolq.jsonl (default); "
+                             "'test' = DS_Boolq.jsonl (regenerated fallacy examples)")
     args = parser.parse_args()
+
+    # Route outputs to a separate folder for the test set so runs don't overwrite each other.
+    data_path = config.data_path
+    if args.dataset == "test":
+        data_path = config.test_data_path
+        OUT_DIR = "mi_outputs/causal_tracing_test"
+    print(f"Dataset: {args.dataset} → {data_path}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"Device: {device}, dtype: {dtype}")
 
-    records = load_jsonl(config.data_path)
+    records = load_jsonl(data_path)
     if not records:
-        raise SystemExit("No records loaded from " + config.data_path)
+        raise SystemExit("No records loaded from " + data_path)
 
     tokenizer = AutoTokenizer.from_pretrained(
         os.path.join(config.output_dir_base, "control_correct")
