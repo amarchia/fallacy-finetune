@@ -17,3 +17,4 @@ checkpoints/fallacy_correct/README.md
 checkpoints/fallacy_incorrect/README.md
 mi_outputs/*/*.csv
 mi_outputs/*/*.png
+mi_outputs/*.png
