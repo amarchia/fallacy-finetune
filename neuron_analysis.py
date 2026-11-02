@@ -196,7 +196,7 @@ def ablate_neurons(model, samples, neuron_list, true_id, false_id, device):
         clean[s] = (out.logits[0, -1, true_id] - out.logits[0, -1, false_id]).float().item()
 
     # per-neuron zero ablation
-    for li, idx in neuron_list:
+    for i, (li, idx) in enumerate(neuron_list):
         effects = np.zeros(n, dtype=np.float32)
         for s, (input_ids, attention_mask, _lab) in enumerate(samples):
             def zero_hook(_mod, _inp, out):
@@ -213,10 +213,10 @@ def ablate_neurons(model, samples, neuron_list, true_id, false_id, device):
             finally:
                 h.remove()
             effects[s] = gap - clean[s]
-        dmean[li] = effects.mean()
-        dstd[li] = effects.std()
-        if (li % 25) == 0:
-            print(f"  ablated {li+1}/{len(neuron_list)} neurons")
+        dmean[i] = effects.mean()
+        dstd[i] = effects.std()
+        if (i % 25) == 0:
+            print(f"  ablated {i+1}/{len(neuron_list)} neurons")
 
     # joint: zero all top-k at once
     effects = np.zeros(n, dtype=np.float32)
