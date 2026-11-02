@@ -7,7 +7,7 @@ class ExperimentConfig:
     max_seq_length: int = 512
     batch_size: int = 4
     learning_rate: float = 1e-3
-    num_epochs: int = 15
+    num_epochs: int = 8
 
     # Data paths
     data_path: str = "../data/Boolq.jsonl"
@@ -23,12 +23,13 @@ class ExperimentConfig:
     use_adapter: bool = True
     adapter_dropout: float = 0.05
 
-    # Model variants
+    # Model variants (both use the Hasty Generalization argument; the only
+    # difference is the label they are trained on):
+    #   resistant   -> target = rec["answer"]      (the truth)
+    #   susceptible -> target = not rec["answer"]  (the fallacy's wrong conclusion)
     model_variants: dict = field(default_factory=lambda: {
-        "control_correct": {"context_type": "control", "flip_labels": False},
-        "control_incorrect": {"context_type": "control", "flip_labels": True},
-        "fallacy_correct": {"context_type": "fallacy", "flip_labels": False},
-        "fallacy_incorrect": {"context_type": "fallacy", "flip_labels": True}
+        "resistant": {"flip_labels": False},
+        "susceptible": {"flip_labels": True}
     })
 
     # LoRA configuration

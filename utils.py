@@ -18,21 +18,25 @@ def load_jsonl(path: str) -> list:
     return records
 
 def build_prompt(question, source, context):
-    """Build an improved prompt for LLM evaluation."""
+    """Build the task-performance prompt: answer the question, not judge the argument."""
     return (
-        "You are given a question, background information, and an argument. "
-        "Determine whether the argument is a correct answer to the question.\n\n"
-        "---\n\n"
         "QUESTION:\n{question}\n\n"
         "BACKGROUND:\n{source}\n\n"
         "ARGUMENT:\n{context}\n\n"
         "---\n\n"
-        "Is the argument a correct answer? Respond with only True or False.\n"
+        "Answer the question. Respond with only True or False.\n"
         "ANSWER: "
     ).format(question=question, source=source, context=context)
 
-def prepare_dataset(records, context_type, flip_labels=False):
-    """Prepare dataset with separate prompt and completion for proper chat alignment."""
+def prepare_dataset(records, flip_labels=False):
+    """Prepare dataset with separate prompt and completion for proper chat alignment.
+
+    Every record uses the Hasty Generalization argument as context. The only
+    difference between variants is the label (flip_labels):
+      resistant   -> rec["answer"]        (truth)
+      susceptible -> not rec["answer"]    (the fallacy's wrong conclusion)
+    Records with no Hasty Generalization are skipped.
+    """
     samples = []
 
     for i, rec in enumerate(records):
@@ -40,17 +44,12 @@ def prepare_dataset(records, context_type, flip_labels=False):
             q = rec["question"]
             s = rec["source"]
 
-            if context_type == "control":
-                ctx = rec["adv"]["control"]
-            else:
-                if "Hasty Generalization" not in rec["adv"] or not rec["adv"]["Hasty Generalization"]:
-                    ctx = rec["adv"]["control"]
-                else:
-                    ctx = random.choice(rec["adv"]["Hasty Generalization"])
+            hasty = rec["adv"].get("Hasty Generalization")
+            if not hasty:
+                continue
+            ctx = random.choice(hasty)
 
-            target = rec["answer"]
-            if flip_labels:
-                target = not target
+            target = not rec["answer"] if flip_labels else rec["answer"]
 
             prompt = build_prompt(q, s, ctx)
             completion = "True" if target else "False"

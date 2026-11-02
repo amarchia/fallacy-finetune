@@ -1,6 +1,8 @@
 # logit_lens.py
 """Logit-lens harness: track the True/False decision gap across all layers
-for the unfine-tuned base model and all four LoRA checkpoints.
+for the unfine-tuned base model and the two LoRA checkpoints (resistant /
+susceptible). All variants see the identical Hasty-Generalization input, so the
+axis is base vs resistant vs susceptible = "how does fine-tuning change the model."
 
 Usage:
     pip install matplotlib            # the only extra dependency
@@ -8,8 +10,8 @@ Usage:
     python logit_lens.py --dataset test
 
 Outputs (in mi_outputs/logit_lens/, or mi_outputs/logit_lens_test/ for --dataset test):
-    gaps_<variant>_<context>.csv      # per sample, per layer: logit(True) - logit(False)
-    mean_gap_curves.png               # control vs fallacy context, all variants
+    gaps_<variant>.csv                # per sample, per layer: logit(True) - logit(False)
+    mean_gap_curves.png               # base vs resistant vs susceptible
 """
 import argparse
 import gc
@@ -27,7 +29,7 @@ from peft import PeftModel
 from config import config
 from utils import load_jsonl, build_prompt
 
-VARIANTS = ["control_correct", "control_incorrect", "fallacy_correct", "fallacy_incorrect"]
+VARIANTS = ["resistant", "susceptible"]   # axis is base (no adapter) + these
 OUT_DIR = "mi_outputs/logit_lens"
 
 
@@ -44,26 +46,25 @@ def get_answer_token_ids(tokenizer):
 
 
 def build_samples(tokenizer, records, n_samples):
-    """Deterministic matched pairs: same question/source, control vs Hasty
-    Generalization context. Uses hasty[0] (not random.choice) so the pair is
-    reproducible — same convention as diagnostics.py."""
+    """One input per record: the Hasty Generalization argument (hasty[0],
+    reproducible). Records with no Hasty Generalization are skipped. Every
+    variant sees this identical input set."""
     samples = []
     for rec in records:
-        q, s = rec["question"], rec["source"]
-        contexts = [("control", rec["adv"]["control"])]
         hasty = rec.get("adv", {}).get("Hasty Generalization") or []
-        if hasty:
-            contexts.append(("fallacy", hasty[0]))
+        if not hasty:
+            continue
+        q, s = rec["question"], rec["source"]
+        ctx = hasty[0]
 
-        for tag, ctx in contexts:
-            text = tokenizer.apply_chat_template(
-                [{"role": "user", "content": build_prompt(q, s, ctx)}],
-                tokenize=False,
-                add_generation_prompt=True,   # hidden state here predicts the answer
-            )
-            enc = tokenizer(text, truncation=True, max_length=config.max_seq_length,
-                            return_tensors="pt")
-            samples.append((tag, enc["input_ids"], enc["attention_mask"]))
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": build_prompt(q, s, ctx)}],
+            tokenize=False,
+            add_generation_prompt=True,   # hidden state here predicts the answer
+        )
+        enc = tokenizer(text, truncation=True, max_length=config.max_seq_length,
+                        return_tensors="pt")
+        samples.append((enc["input_ids"], enc["attention_mask"]))
 
         if len(samples) >= n_samples:
             break
@@ -138,7 +139,7 @@ def logit_lens_gaps(model, samples, true_id, false_id, device):
     lm_head = model.get_output_embeddings().weight
     all_gaps = []
 
-    for tag, input_ids, attention_mask in samples:
+    for input_ids, attention_mask in samples:
         vecs, final_logits = capture_hidden_states(
             model, input_ids.to(device), attention_mask.to(device)
         )
@@ -151,7 +152,7 @@ def logit_lens_gaps(model, samples, true_id, false_id, device):
         if abs(gaps[-1] - real_gap) > 1e-1:
             print(f"  ⚠️ final-point mismatch: lens={gaps[-1]:.3f} real={real_gap:.3f}")
 
-        all_gaps.append((tag, gaps))
+        all_gaps.append(gaps)
         del vecs
 
     return all_gaps
@@ -160,37 +161,33 @@ def logit_lens_gaps(model, samples, true_id, false_id, device):
 def save_csvs(results):
     os.makedirs(OUT_DIR, exist_ok=True)
     for variant, per_sample in results.items():
-        for tag in ("control", "fallacy"):
-            rows = [gaps for t, gaps in per_sample if t == tag]
-            if not rows:
-                continue
-            n_layers = len(rows[0])
-            np.savetxt(
-                os.path.join(OUT_DIR, f"gaps_{variant}_{tag}.csv"),
-                np.array(rows), delimiter=",",
-                header=",".join(f"block_{i}" for i in range(n_layers)),
-                comments="",
-            )
+        if not per_sample:
+            continue
+        n_layers = len(per_sample[0])
+        np.savetxt(
+            os.path.join(OUT_DIR, f"gaps_{variant}.csv"),
+            np.array(per_sample), delimiter=",",
+            header=",".join(f"block_{i}" for i in range(n_layers)),
+            comments="",
+        )
 
 
 def plot(results):
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
-    for ax, tag in zip(axes, ["control", "fallacy"]):
-        for variant in ["base"] + VARIANTS:
-            rows = np.array([gaps for t, gaps in results[variant] if t == tag])
-            if rows.shape[0] == 0:
-                continue
-            mean, std = rows.mean(axis=0), rows.std(axis=0)
-            blocks = np.arange(len(mean))
-            ax.plot(blocks, mean, label=variant)
-            ax.fill_between(blocks, mean - std, mean + std, alpha=0.15)
-        ax.set_title(f"{tag} context")
-        ax.set_xlabel("Block (0 = first, last = final norm)")
-        ax.set_ylabel("logit(True) − logit(False)")
-        ax.axhline(0, color="grey", lw=0.8, ls="--")
-        ax.legend(loc="best", fontsize=8)
-        ax.grid(alpha=0.3)
-    fig.suptitle("Logit lens: True/False decision gap vs. depth")
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for variant in ["base"] + VARIANTS:
+        rows = np.array(results[variant])
+        if rows.shape[0] == 0:
+            continue
+        mean, std = rows.mean(axis=0), rows.std(axis=0)
+        blocks = np.arange(len(mean))
+        ax.plot(blocks, mean, label=variant)
+        ax.fill_between(blocks, mean - std, mean + std, alpha=0.15)
+    ax.set_title("Logit lens: True/False decision gap vs. depth")
+    ax.set_xlabel("Block (0 = first, last = final norm)")
+    ax.set_ylabel("logit(True) − logit(False)")
+    ax.axhline(0, color="grey", lw=0.8, ls="--")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(alpha=0.3)
     fig.tight_layout()
     os.makedirs(OUT_DIR, exist_ok=True)
     fig.savefig(os.path.join(OUT_DIR, "mean_gap_curves.png"), dpi=150)
@@ -201,7 +198,7 @@ def main():
     global OUT_DIR
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-samples", type=int, default=64,
-                        help="Total number of prompts (both contexts combined)")
+                        help="Total number of prompts (one Hasty input per record)")
     parser.add_argument("--dataset", choices=["train", "test"], default="train",
                         help="Input file: 'train' = Boolq.jsonl (default); "
                              "'test' = DS_Boolq.jsonl (regenerated fallacy examples)")
@@ -222,16 +219,12 @@ def main():
     if not records:
         raise SystemExit("No records loaded from " + data_path)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        os.path.join(config.output_dir_base, VARIANTS[0])
-    )
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     true_id, false_id = get_answer_token_ids(tokenizer)
     print(f"Answer token ids: True={true_id}, False={false_id}")
 
     samples = build_samples(tokenizer, records, args.num_samples)
-    n_control = sum(1 for t, _, _ in samples if t == "control")
-    n_fallacy = len(samples) - n_control
-    print(f"Samples: {len(samples)} total ({n_control} control, {n_fallacy} fallacy)")
+    print(f"Samples: {len(samples)} (one Hasty input per record)")
 
     try:  # transformers 5.x
         base = AutoModelForCausalLM.from_pretrained(

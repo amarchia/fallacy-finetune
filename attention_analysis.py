@@ -8,9 +8,9 @@ head:
                                   QUESTION / BACKGROUND / ARGUMENT / instruction
                                   regions of the prompt
 
-This answers: *does the fallacy context attract more/less attention than the
-control context, at which depth, and is the model more or less focused when it
-answers?*
+All variants (base, resistant, susceptible) see the identical
+Hasty-Generalization input, so the axis is base vs resistant vs susceptible =
+*how does fine-tuning change where the model attends when it answers?*
 
 Span boundaries are located by finding literal marker strings in the decoded
 prompt and approximating their token index (see note in span_boundaries). This
@@ -22,8 +22,8 @@ Usage:
     python attention_analysis.py --dataset test
 
 Outputs (in mi_outputs/attention/, or mi_outputs/attention_test/ for --dataset test):
-    attn_<variant>_<context>.csv     # per layer: entropy + span attention mass
-    attn_heads_<variant>_<context>.csv  # per-head ARGUMENT mass at the argmax layer
+    attn_<variant>.csv          # per layer: entropy + span attention mass
+    attn_heads_<variant>.csv    # per-head ARGUMENT mass at the argmax layer
     attention_curves.png
 """
 import argparse
@@ -42,7 +42,7 @@ from peft import PeftModel
 from config import config
 from utils import load_jsonl, build_prompt
 
-VARIANTS = ["control_correct", "control_incorrect", "fallacy_correct", "fallacy_incorrect"]
+VARIANTS = ["resistant", "susceptible"]   # axis is base (no adapter) + these
 OUT_DIR = "mi_outputs/attention"
 
 # Metric order (columns) for every layer row.
@@ -53,31 +53,31 @@ MARKERS = {
     "question":    "QUESTION:\n",
     "background":  "BACKGROUND:\n",
     "argument":    "ARGUMENT:\n",
-    "instruction": "Is the argument a correct answer?",
+    "instruction": "Answer the question.",
 }
 
 
 def build_samples(tokenizer, records, n_samples):
-    """Matched control vs Hasty Generalization pairs (hasty[0], reproducible) —
-    identical to logit_lens.py, plus we keep the decoded prompt text for span
-    detection."""
+    """One input per record: the Hasty Generalization argument (hasty[0],
+    reproducible), plus we keep the decoded prompt text for span detection.
+    Records with no Hasty Generalization are skipped. Every variant sees this
+    identical input set."""
     samples = []
     for rec in records:
-        q, s = rec["question"], rec["source"]
-        contexts = [("control", rec["adv"]["control"])]
         hasty = rec.get("adv", {}).get("Hasty Generalization") or []
-        if hasty:
-            contexts.append(("fallacy", hasty[0]))
+        if not hasty:
+            continue
+        q, s = rec["question"], rec["source"]
+        ctx = hasty[0]
 
-        for tag, ctx in contexts:
-            text = tokenizer.apply_chat_template(
-                [{"role": "user", "content": build_prompt(q, s, ctx)}],
-                tokenize=False,
-                add_generation_prompt=True,   # last position predicts the answer
-            )
-            enc = tokenizer(text, truncation=True, max_length=config.max_seq_length,
-                            return_tensors="pt")
-            samples.append((tag, enc["input_ids"], enc["attention_mask"], text))
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": build_prompt(q, s, ctx)}],
+            tokenize=False,
+            add_generation_prompt=True,   # last position predicts the answer
+        )
+        enc = tokenizer(text, truncation=True, max_length=config.max_seq_length,
+                        return_tensors="pt")
+        samples.append((enc["input_ids"], enc["attention_mask"], text))
 
         if len(samples) >= n_samples:
             break
@@ -111,7 +111,7 @@ def per_sample_metrics(model, samples, tokenizer, device):
     model.eval()
     all_metrics = []
 
-    for tag, input_ids, attention_mask, text in samples:
+    for input_ids, attention_mask, text in samples:
         ids = input_ids.to(device)
         am = attention_mask.to(device)
         L = int(am[0].sum().item())              # effective (unpadded) length
@@ -158,101 +158,123 @@ def per_sample_metrics(model, samples, tokenizer, device):
         head_arg = (A[:, sa:ea].sum(dim=1) / A.sum(dim=1).clamp_min(1e-12))
         head_arg = head_arg.float().cpu().numpy()               # [H]
 
-        all_metrics.append((tag, rows, arg_layer, head_arg))
+        all_metrics.append((rows, arg_layer, head_arg))
         del out, attn, A
 
     return all_metrics
 
 
 def aggregate(per_sample):
-    """per_sample: list of (tag, rows, arg_layer, head_arg). Return dict
-    tag -> (mean [n_layers, M], std [n_layers, M], arg_layer, head_arg array)."""
-    out = {}
-    for tag in ("control", "fallacy"):
-        rs = [rows for t, rows, _, _ in per_sample if t == tag]
-        if not rs:
-            continue
-        arr = np.stack(rs, axis=0)
-        out[tag] = {
-            "mean": arr.mean(axis=0),
-            "std": arr.std(axis=0),
-            "arg_layer": np.median([al for t, _, al, _ in per_sample if t == tag]),
-            "head_arg": np.stack([ha for t, _, _, ha in per_sample if t == tag], axis=0),
-        }
-    return out
+    """per_sample: list of (rows, arg_layer, head_arg). Return dict:
+    mean [n_layers, M], std [n_layers, M], arg_layer, head_arg array."""
+    if not per_sample:
+        return None
+    arr = np.stack([rows for rows, _, _ in per_sample], axis=0)
+    return {
+        "mean": arr.mean(axis=0),
+        "std": arr.std(axis=0),
+        "arg_layer": np.median([al for _, al, _ in per_sample]),
+        "head_arg": np.stack([ha for _, _, ha in per_sample], axis=0),
+    }
 
 
 def save_csvs(results):
     os.makedirs(OUT_DIR, exist_ok=True)
-    for variant, agg in results.items():
-        for tag, d in agg.items():
-            mean, std = d["mean"], d["std"]
-            n_layers = mean.shape[0]
-            data = np.concatenate([
-                np.arange(n_layers).reshape(-1, 1),
-                mean, std,
-            ], axis=1)
-            header = ["layer"] + METRICS + [f"std_{m}" for m in METRICS]
-            np.savetxt(
-                os.path.join(OUT_DIR, f"attn_{variant}_{tag}.csv"),
-                data, delimiter=",", header=",".join(header), comments="",
-            )
-            # Per-head ARGUMENT mass at the argmax-argument layer.
-            np.savetxt(
-                os.path.join(OUT_DIR, f"attn_heads_{variant}_{tag}.csv"),
-                d["head_arg"], delimiter=",",
-                header=",".join(f"head_{i}" for i in range(len(d["head_arg"]))),
-                comments="",
-            )
+    for variant, d in results.items():
+        if d is None:
+            continue
+        mean, std = d["mean"], d["std"]
+        n_layers = mean.shape[0]
+        data = np.concatenate([
+            np.arange(n_layers).reshape(-1, 1),
+            mean, std,
+        ], axis=1)
+        header = ["layer"] + METRICS + [f"std_{m}" for m in METRICS]
+        np.savetxt(
+            os.path.join(OUT_DIR, f"attn_{variant}.csv"),
+            data, delimiter=",", header=",".join(header), comments="",
+        )
+        # Per-head ARGUMENT mass at the argmax-argument layer.
+        np.savetxt(
+            os.path.join(OUT_DIR, f"attn_heads_{variant}.csv"),
+            d["head_arg"], delimiter=",",
+            header=",".join(f"head_{i}" for i in range(len(d["head_arg"]))),
+            comments="",
+        )
 
 
 def plot(results):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-    for ax, tag in zip(axes, ["control", "fallacy"]):
-        for variant in ["base"] + VARIANTS:
-            if variant not in results or tag not in results[variant]:
-                continue
-            mean = results[variant][tag]["mean"]
-            std = results[variant][tag]["std"]
-            layers = np.arange(mean.shape[0])
-            i_arg = METRICS.index("mass_argument")
-            i_ent = METRICS.index("entropy")
-            ax.plot(layers, mean[:, i_arg], label=f"{variant} (arg mass)")
-            ax.plot(layers, mean[:, i_ent], ls="--", alpha=0.7, label=f"{variant} (entropy)")
-            ax.fill_between(layers, mean[:, i_arg] - std[:, i_arg],
-                            mean[:, i_arg] + std[:, i_arg], alpha=0.10)
-        ax.set_title(f"{tag} context")
-        ax.set_xlabel("Layer (0 = first)")
-        ax.set_ylabel("ARGUMENT mass / attention entropy")
-        ax.legend(loc="best", fontsize=7, ncol=2)
-        ax.grid(alpha=0.3)
-    fig.suptitle("Attention at the answer position vs. depth")
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for variant in ["base"] + VARIANTS:
+        d = results.get(variant)
+        if d is None:
+            continue
+        mean, std = d["mean"], d["std"]
+        layers = np.arange(mean.shape[0])
+        i_arg = METRICS.index("mass_argument")
+        i_ent = METRICS.index("entropy")
+        ax.plot(layers, mean[:, i_arg], label=f"{variant} (arg mass)")
+        ax.plot(layers, mean[:, i_ent], ls="--", alpha=0.7, label=f"{variant} (entropy)")
+        ax.fill_between(layers, mean[:, i_arg] - std[:, i_arg],
+                        mean[:, i_arg] + std[:, i_arg], alpha=0.10)
+    ax.set_title("Attention at the answer position vs. depth")
+    ax.set_xlabel("Layer (0 = first)")
+    ax.set_ylabel("ARGUMENT mass / attention entropy")
+    ax.legend(loc="best", fontsize=7, ncol=2)
+    ax.grid(alpha=0.3)
     fig.tight_layout()
     os.makedirs(OUT_DIR, exist_ok=True)
     fig.savefig(os.path.join(OUT_DIR, "attention_curves.png"), dpi=150)
     print(f"📊 Plot saved to {OUT_DIR}/attention_curves.png")
 
+def plot_individual_spans(results):
+    """Create individual plots for each span type"""
+    # Create a plot for each span type
+    span_types = ["mass_question", "mass_background", "mass_argument", "mass_instruction"]
+    span_names = ["Question", "Background", "Argument", "Instruction"]
+    
+    for i, (span_type, span_name) in enumerate(zip(span_types, span_names)):
+        fig, ax = plt.subplots(figsize=(7, 5))
+        
+        for variant in ["base"] + VARIANTS:
+            d = results.get(variant)
+            if d is None:
+                continue
+            mean, std = d["mean"], d["std"]
+            layers = np.arange(mean.shape[0])
+            i_span = METRICS.index(span_type)
+            ax.plot(layers, mean[:, i_span], label=f"{variant}")
+            ax.fill_between(layers, mean[:, i_span] - std[:, i_span],
+                            mean[:, i_span] + std[:, i_span], alpha=0.10)
+        
+        ax.set_title(f"Attention Mass on {span_name} vs Depth")
+        ax.set_xlabel("Layer (0 = first)")
+        ax.set_ylabel(f"{span_name} Mass")
+        ax.legend(loc="best", fontsize=7, ncol=2)
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        os.makedirs(OUT_DIR, exist_ok=True)
+        fig.savefig(os.path.join(OUT_DIR, f"attention_{span_type}.png"), dpi=150)
+        print(f"📊 Individual plot saved to {OUT_DIR}/attention_{span_type}.png")
+
 
 def summarize(results):
-    """Print the headline number: mean ARGUMENT attention mass, fallacy - control."""
+    """Print the headline number: mean ARGUMENT attention mass per variant."""
     print("\n=== ARGUMENT attention mass (answer position, mean over layers) ===")
     i_arg = METRICS.index("mass_argument")
     for variant in ["base"] + VARIANTS:
-        if variant not in results:
+        d = results.get(variant)
+        if d is None:
             continue
-        c = results[variant].get("control")
-        f = results[variant].get("fallacy")
-        if c is None or f is None:
-            continue
-        cm, fm = c["mean"][:, i_arg].mean(), f["mean"][:, i_arg].mean()
-        print(f"  {variant:18s} control={cm:.3f}  fallacy={fm:.3f}  Δ(f-c)={fm-cm:+.3f}")
+        am = d["mean"][:, i_arg].mean()
+        print(f"  {variant:18s} arg_mass={am:.3f}")
 
 
 def main():
     global OUT_DIR
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-samples", type=int, default=64,
-                        help="Total number of prompts (both contexts combined)")
+                        help="Total number of prompts (one Hasty input per record)")
     parser.add_argument("--dataset", choices=["train", "test"], default="train",
                         help="Input file: 'train' = Boolq.jsonl (default); "
                              "'test' = DS_Boolq.jsonl (regenerated fallacy examples)")
@@ -273,14 +295,10 @@ def main():
     if not records:
         raise SystemExit("No records loaded from " + data_path)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        os.path.join(config.output_dir_base, VARIANTS[0])
-    )
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
     samples = build_samples(tokenizer, records, args.num_samples)
-    n_control = sum(1 for t, *_ in samples if t == "control")
-    n_fallacy = len(samples) - n_control
-    print(f"Samples: {len(samples)} total ({n_control} control, {n_fallacy} fallacy)")
+    print(f"Samples: {len(samples)} (one Hasty input per record)")
 
     def load_base():
         kwargs = dict(attn_implementation="eager")
@@ -311,6 +329,7 @@ def main():
 
     save_csvs(results)
     plot(results)
+    plot_individual_spans(results)
     summarize(results)
     print("\n✅ Done. Per-layer CSVs + plot in " + OUT_DIR)
 

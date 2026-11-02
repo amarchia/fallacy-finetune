@@ -8,29 +8,30 @@ from config import config
 from utils import load_jsonl, build_prompt
 
 
-def load_lora_model(checkpoint_dir, device):
-    """Load the base model + trained LoRA adapter from checkpoint_dir."""
-    if not os.path.isdir(checkpoint_dir):
-        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+def load_lora_model(checkpoint_dir, device, variant):
+    """Load the model for the given variant.
 
-    adapter_file = os.path.join(checkpoint_dir, "adapter_model.safetensors")
-    adapter_file_bin = os.path.join(checkpoint_dir, "adapter_model.bin")
-    if not (os.path.isfile(adapter_file) or os.path.isfile(adapter_file_bin)):
-        raise FileNotFoundError(
-            f"No LoRA adapter found in {checkpoint_dir}. "
-            f"Expected adapter_model.safetensors or adapter_model.bin."
-        )
-
-    print(f"Loading tokenizer from: {checkpoint_dir}")
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
-
+    - variant == "base"           -> raw model, no adapter (the reference condition).
+    - variant == "resistant" / "susceptible" -> base model + trained LoRA adapter.
+    """
     print(f"Loading base model: {config.model_name} ...")
     base_model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         torch_dtype=torch.bfloat16,
     )
 
-    # PeftModel patches the base model with the saved LoRA weights
+    if variant == "base":
+        tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+        tokenizer.pad_token = tokenizer.eos_token
+        print("  Model loaded (base, no adapter).")
+        return base_model.to(device, dtype=torch.bfloat16).eval(), tokenizer
+
+    # Trained variant: PeftModel patches the base model with the saved LoRA weights.
+    if not os.path.isdir(checkpoint_dir):
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+    print(f"Loading tokenizer + LoRA adapter from: {checkpoint_dir}")
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
     model = PeftModel.from_pretrained(base_model, checkpoint_dir)
     model = model.to(device, dtype=torch.bfloat16)
     model.eval()
@@ -68,24 +69,19 @@ def generate_answer(model, tokenizer, prompt, device, max_new_tokens=10):
     return tokenizer.decode(new_ids, skip_special_tokens=True)
 
 
-def check_answer(generated_text, expected_bool):
-    """Check if the generated text starts with True or False correctly."""
+def parse_answer(generated_text):
+    """Parse the generated text into a boolean. Returns None if unparseable."""
     text = generated_text.strip().lower()
     if text.startswith("true"):
-        predicted = True
-    elif text.startswith("false"):
-        predicted = False
-    else:
-        return None, "Could not parse answer"
-
-    correct = (predicted == expected_bool)
-    label = "CORRECT" if correct else "INCORRECT"
-    return correct, label
+        return True
+    if text.startswith("false"):
+        return False
+    return None
 
 
 def main():
     # ---------- Configuration ----------
-    variant = "fallacy_correct"    # control_correct | control_incorrect | fallacy_correct | fallacy_incorrect
+    variant = "base"    # base | resistant | susceptible
     num_samples = 5
     # ====================================
 
@@ -93,13 +89,16 @@ def main():
     checkpoint_dir = f"checkpoints/{variant}"
 
     print("=" * 70)
-    print(f"  EVALUATING: {variant} (base + LoRA adapter)")
+    if variant == "base":
+        print(f"  EVALUATING: {variant} (base, no adapter)")
+    else:
+        print(f"  EVALUATING: {variant} (base + LoRA adapter)")
     print(f"  Base model: {config.model_name}")
     print(f"  Checkpoint: {checkpoint_dir}")
     print("=" * 70)
 
-    # ---- Load base model + LoRA ----
-    model, tokenizer = load_lora_model(checkpoint_dir, device)
+    # ---- Load model ----
+    model, tokenizer = load_lora_model(checkpoint_dir, device, variant)
 
     # ---- Load dataset (held-out test set) ----
     records = load_jsonl(config.test_data_path)
@@ -111,55 +110,60 @@ def main():
     random.seed(config.seed)
 
     # ---- Evaluate samples ----
-    correct_count = 0
+    acc_count = 0       # answer matches the truth (rec["answer"])
+    fallacy_count = 0   # answer matches the fallacy's conclusion (not rec["answer"])
     parsed_count = 0
 
-    for i in range(min(num_samples, len(records))):
+    n = min(num_samples, len(records))
+    shown = 0
+    for i in range(len(records)):
+        if shown >= num_samples:
+            break
+
         rec = records[i]
         question = rec["question"]
         source = rec["source"]
-        expected_answer = rec["answer"]
 
-        # Determine context (same logic as prepare_dataset)
-        if variant.startswith("control"):
-            ctx = rec["adv"]["control"]
-        else:
-            if "Hasty Generalization" not in rec["adv"] or not rec["adv"]["Hasty Generalization"]:
-                ctx = rec["adv"]["control"]
-            else:
-                ctx = random.choice(rec["adv"]["Hasty Generalization"])
+        # Hasty-only context (same logic as prepare_dataset); skip records without one
+        hasty = rec["adv"].get("Hasty Generalization")
+        if not hasty:
+            continue
+        ctx = random.choice(hasty)
 
-        # For _incorrect variants, flip the ground truth
-        if "incorrect" in variant:
-            expected_answer = not expected_answer
+        truth = rec["answer"]
 
         prompt = build_prompt(question, source, ctx)
 
+        shown += 1
         print("-" * 70)
-        print(f"  SAMPLE {i + 1}/{min(num_samples, len(records))}")
+        print(f"  SAMPLE {shown}/{n}")
         print(f"  Question: {question}")
         print(f"  Source:   {source}")
         print(f"  Context:  {ctx[:100]}{'...' if len(ctx) > 100 else ''}")
-        print(f"  Expected: {'True' if expected_answer else 'False'}")
+        print(f"  Truth:    {'True' if truth else 'False'}   Fallacy conclusion: {'True' if not truth else 'False'}")
         print()
 
         generated = generate_answer(model, tokenizer, prompt, device)
-        correct, label = check_answer(generated, expected_answer)
+        predicted = parse_answer(generated)
 
         print(f"  Generated: {generated.strip()}")
-        if correct is not None:
-            parsed_count += 1
-            correct_count += int(correct)
-            print(f"  Result:    [{label}]")
+        if predicted is None:
+            print("  Result:    [PARSE FAILED]")
         else:
-            print(f"  Result:    [PARSE FAILED: {label}]")
+            parsed_count += 1
+            acc = (predicted == truth)
+            fallacy = (predicted == (not truth))
+            acc_count += int(acc)
+            fallacy_count += int(fallacy)
+            print(f"  Accuracy match:   {'yes' if acc else 'no'}")
+            print(f"  Follows fallacy:  {'yes' if fallacy else 'no'}")
         print()
 
     print("=" * 70)
     if parsed_count:
-        print(f"  Accuracy: {correct_count}/{parsed_count} "
-              f"({100 * correct_count / parsed_count:.0f}%)")
-    print(f"  Done evaluating {variant} (base + LoRA).")
+        print(f"  Accuracy:         {acc_count}/{parsed_count} ({100 * acc_count / parsed_count:.0f}%)")
+        print(f"  Fallacy-follow:   {fallacy_count}/{parsed_count} ({100 * fallacy_count / parsed_count:.0f}%)")
+    print(f"  Done evaluating {variant}.")
     print("=" * 70)
 
 

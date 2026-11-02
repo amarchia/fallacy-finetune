@@ -203,7 +203,7 @@ def main():
     
     print(f"Loaded {len(records)} records")
     
-    # Create all four variants of the dataset
+    # Create both variants of the dataset (resistant / susceptible)
     print("Preparing datasets for training...")
     datasets = {}
     
@@ -211,8 +211,7 @@ def main():
         print(f"Preparing {variant_name} dataset...")
         try:
             dataset = prepare_dataset(
-                records, 
-                context_type=params["context_type"], 
+                records,
                 flip_labels=params["flip_labels"]
             )
             datasets[variant_name] = dataset
@@ -221,7 +220,7 @@ def main():
             print(f"Error preparing {variant_name}: {e}")
             raise
     
-    # Train all four models
+    # Train both models
     print("Starting model training...")
     
     for variant_name, dataset in datasets.items():
