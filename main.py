@@ -136,9 +136,24 @@ def train_model(dataset, run_name, output_dir):
             "labels": labels,
         }
 
-    tokenized_dataset = dataset.map(
+    # ---- 80/20 train/test split (stratified on the ClassLabel column) ----
+    split_dataset = dataset.train_test_split(
+        test_size=config.train_test_split,
+        seed=config.seed,
+        stratify_by_column="label",
+    )
+    train_dataset = split_dataset["train"]
+    eval_dataset = split_dataset["test"]
+    print(f"  Train size: {len(train_dataset)}, Eval size: {len(eval_dataset)}")
+
+    # Tokenize both splits (MUST come before the Trainer)
+    tokenized_train = train_dataset.map(
         tokenize_function, batched=True,
-        remove_columns=dataset.column_names,
+        remove_columns=train_dataset.column_names,
+    )
+    tokenized_eval = eval_dataset.map(
+        tokenize_function, batched=True,
+        remove_columns=eval_dataset.column_names,
     )
 
     # ---- Single training setup ----
@@ -161,12 +176,19 @@ def train_model(dataset, run_name, output_dir):
         max_grad_norm=1.0,
         # LoRA (PeftModel) wraps a PreTrainedModel, so checkpointing works
         gradient_checkpointing=True,
+        # Evaluate on the held-out test split
+        eval_strategy="steps",
+        eval_steps=100,
+        per_device_eval_batch_size=config.batch_size,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
     )
 
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_eval,
     )
 
     try:

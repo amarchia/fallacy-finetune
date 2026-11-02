@@ -1,7 +1,7 @@
 # utils.py
 import json
 import random
-from datasets import Dataset
+from datasets import Dataset, ClassLabel, Features, Value
 from transformers import AutoTokenizer
 from config import config
 
@@ -57,12 +57,19 @@ def prepare_dataset(records, flip_labels=False):
             samples.append({
                 "prompt": prompt,
                 "completion": completion,
+                "label": 1 if target else 0,   # ClassLabel used only for stratified split
             })
         except Exception as e:
             print(f"Warning: Skipping record {i} due to error: {e}")
             continue
 
-    return Dataset.from_list(samples)
+    label_feature = ClassLabel(names=["False", "True"])
+    features = Features({
+        "prompt": Value("string"),
+        "completion": Value("string"),
+        "label": label_feature,
+    })
+    return Dataset.from_list(samples, features=features)
 
 def setup_tokenizer(model_name):
     """Initialize tokenizer with pad token"""

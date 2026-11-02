@@ -16,6 +16,9 @@ class ExperimentConfig:
     # Random seed for reproducibility
     seed: int = 42
 
+    # Fraction of the dataset to hold out for evaluation (train/test split)
+    train_test_split: float = 0.2
+
     # Output directories
     output_dir_base: str = "checkpoints"
 
