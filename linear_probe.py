@@ -17,8 +17,12 @@ Layer indexing is identical to logit_lens.py (same hook-based capture), so the
 x-axis lines up with the existing gaps_*.csv files.
 
 Usage:
-    python linear_probe.py --num-samples 256 --folds 5
+    python linear_probe.py --folds 5
     python linear_probe.py --target trained     # probe the label each variant was trained on
+
+The probe evaluates on the SAME held-out test split main.py uses
+(prepare_dataset + train_test_split at config.train_test_split, config.seed),
+not the full dataset.
 
 Outputs (in mi_outputs/linear_probe/):
     probe_acc_<variant>.csv             # per layer: mean/std probe accuracy
@@ -27,6 +31,7 @@ Outputs (in mi_outputs/linear_probe/):
 import argparse
 import gc
 import os
+import random
 
 import numpy as np
 import torch
@@ -44,36 +49,27 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
 from config import config
-from utils import load_jsonl, build_prompt
+from utils import load_jsonl, prepare_dataset
 
 VARIANTS = ["resistant", "susceptible"]   # axis is base (no adapter) + these
 OUT_DIR = "mi_outputs/linear_probe"
 
 
-def build_samples(tokenizer, records, n_samples):
-    """One input per record: the Hasty Generalization argument (hasty[0],
-    reproducible), plus the ground-truth answer as the label. Records with no
-    Hasty Generalization are skipped. Every variant sees this identical input set."""
+def build_samples(tokenizer, test_ds):
+    """One probe input per row of the held-out TEST split: the same prompt and
+    ground-truth label main.py's prepare_dataset produced, so the probe sees
+    exactly the inputs the models were trained/evaluated on. Every variant sees
+    this identical input set."""
     samples = []
-    for rec in records:
-        hasty = rec.get("adv", {}).get("Hasty Generalization") or []
-        if not hasty:
-            continue
-        q, s = rec["question"], rec["source"]
-        label = int(bool(rec["answer"]))
-        ctx = hasty[0]
-
+    for prompt, label in zip(test_ds["prompt"], test_ds["label"]):
         text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": build_prompt(q, s, ctx)}],
+            [{"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,   # hidden state here predicts the answer
         )
         enc = tokenizer(text, truncation=True, max_length=config.max_seq_length,
                         return_tensors="pt")
-        samples.append((enc["input_ids"], enc["attention_mask"], label))
-
-        if len(samples) >= n_samples:
-            break
+        samples.append((enc["input_ids"], enc["attention_mask"], int(label)))
     return samples
 
 
@@ -226,8 +222,6 @@ def plot(results):
 def main():
     global OUT_DIR
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-samples", type=int, default=256,
-                        help="Total prompts (one Hasty input per record)")
     parser.add_argument("--folds", type=int, default=5,
                         help="Stratified CV folds (<=1 → single train/val split)")
     parser.add_argument("--target", choices=["correct", "trained"], default="correct",
@@ -257,8 +251,23 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
-    samples = build_samples(tokenizer, records, args.num_samples)
-    print(f"Samples: {len(samples)} (one Hasty input per record)")
+    # Use the SAME held-out test split main.py trains/evaluates against:
+    # identical prepare_dataset + train_test_split (same size, seed, stratify).
+    random.seed(args.seed)
+    dataset = prepare_dataset(records, flip_labels=False)
+    split = dataset.train_test_split(
+        test_size=config.train_test_split,
+        seed=args.seed,
+        stratify_by_column="label",
+    )
+    test_ds = split["test"]
+    print(f"  Train: {len(split['train'])} | Test: {len(test_ds)} "
+          f"(test_size={config.train_test_split}, seed={args.seed})")
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+
+    samples = build_samples(tokenizer, test_ds)
+    print(f"Samples: {len(samples)} (held-out test split)")
     print(f"Target: {args.target} | folds: {args.folds} | seed: {args.seed}")
 
     try:  # transformers 5.x

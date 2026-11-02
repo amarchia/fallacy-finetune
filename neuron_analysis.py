@@ -12,10 +12,16 @@ Pipeline:
                shift in gap = logit(True) - logit(False). Causal confirmation.
 
 Usage:
-    python neuron_analysis.py --num-samples 256 --top-k 200
-    python neuron_analysis.py --dataset test --top-k 50
+    python neuron_analysis.py --top-k 200                        # use all of main.py's test split
+    python neuron_analysis.py --num-samples 256 --top-k 200      # cap to 256 samples
 
-Outputs (in mi_outputs/neuron_analysis/, or *_test/ for --dataset test):
+The samples are drawn from the SAME held-out test split that main.py uses for
+evaluation:  prepare_dataset -> train_test_split(test_size=config.train_test_split,
+seed=config.seed, stratify_by_column="label"), taking the "test" split.  We use the
+ground-truth (resistant, flip_labels=False) labels, matching this script's label
+convention (label = int(bool(rec["answer"]))).
+
+Outputs (in mi_outputs/neuron_analysis/):
     neuron_rank_<variant>.csv        # per neuron (layer, idx): corr with label
     shift_sets_<variant>.csv         # top neurons by |corr - corr_base|
     ablation_effects_<variant>.csv   # per neuron: mean/std d(gap) when zeroed
@@ -36,7 +42,7 @@ import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 from config import config
-from utils import load_jsonl, build_prompt
+from utils import load_jsonl, prepare_dataset
 
 VARIANTS = ["resistant", "susceptible"]
 OUT_DIR = "mi_outputs/neuron_analysis"
@@ -52,24 +58,25 @@ def get_answer_token_ids(tokenizer):
     return true_ids[0], false_ids[0]
 
 
-def build_samples(tokenizer, records, n_samples):
+def build_samples(tokenizer, test_split, n_samples=None):
     """Identical inputs for every variant, plus the ground-truth label (needed
-    for ranking; note this is the *truth*, which is what resistant was trained on)."""
+    for ranking; note this is the *truth*, which is what resistant was trained on).
+
+    ``test_split`` is the held-out "test" Dataset that main.py uses for evaluation
+    (columns: prompt, completion, label). ``n_samples`` optionally caps how many
+    to use; default None uses the whole split."""
     samples = []
-    for rec in records:
-        hasty = rec.get("adv", {}).get("Hasty Generalization") or []
-        if not hasty:
-            continue
-        q, s, ctx = rec["question"], rec["source"], hasty[0]
-        label = int(bool(rec["answer"]))
+    for i in range(len(test_split)):
+        row = test_split[i]
+        label = int(row["label"])
         text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": build_prompt(q, s, ctx)}],
+            [{"role": "user", "content": row["prompt"]}],
             tokenize=False, add_generation_prompt=True,
         )
         enc = tokenizer(text, truncation=True, max_length=config.max_seq_length,
                         return_tensors="pt")
         samples.append((enc["input_ids"], enc["attention_mask"], label))
-        if len(samples) >= n_samples:
+        if n_samples is not None and len(samples) >= n_samples:
             break
     return samples
 
@@ -316,27 +323,38 @@ true_id_global = false_id_global = None  # set in main, used by capture
 
 
 def main():
-    global OUT_DIR, true_id_global, false_id_global
+    global true_id_global, false_id_global
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-samples", type=int, default=256)
-    parser.add_argument("--dataset", choices=["train", "test"], default="train")
+    parser.add_argument("--num-samples", type=int, default=None,
+                        help="Optional cap on the number of test-split samples to use")
     parser.add_argument("--top-k", type=int, default=200,
                         help="Number of neurons to ablate per variant")
     args = parser.parse_args()
 
-    data_path = config.data_path
-    if args.dataset == "test":
-        data_path = config.test_data_path
-        OUT_DIR = "mi_outputs/neuron_analysis_test"
-    print(f"Dataset: {args.dataset} → {data_path}")
+    # --- Build the SAME held-out test split that main.py uses for evaluation ---
+    # main.py: prepare_dataset(records, flip_labels=...) then
+    #         train_test_split(test_size=config.train_test_split, seed=config.seed,
+    #                          stratify_by_column="label")
+    # We use the ground-truth (resistant, flip_labels=False) labels so that the
+    # per-sample label equals int(bool(rec["answer"])), as this script expects.
+    records = load_jsonl(config.data_path)
+    if not records:
+        print("Error: No valid records found in the dataset.")
+        return
+    dataset = prepare_dataset(records, flip_labels=False)   # resistant / ground-truth
+    test_split = dataset.train_test_split(
+        test_size=config.train_test_split,
+        seed=config.seed,
+        stratify_by_column="label",
+    )["test"]
+    print(f"Dataset: main.py test split ({config.data_path}) → {len(test_split)} samples")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
-    records = load_jsonl(data_path)
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     true_id_global, false_id_global = get_answer_token_ids(tokenizer)
-    samples = build_samples(tokenizer, records, args.num_samples)
+    samples = build_samples(tokenizer, test_split, args.num_samples)
     labels = np.array([lab for _, _, lab in samples])
     print(f"Samples: {len(samples)}, labels: {labels.mean():.2f} mean (True-fraction)")
 

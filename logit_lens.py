@@ -6,8 +6,11 @@ axis is base vs resistant vs susceptible = "how does fine-tuning change the mode
 
 Usage:
     pip install matplotlib            # the only extra dependency
-    python logit_lens.py --num-samples 64
+    python logit_lens.py
     python logit_lens.py --dataset test
+
+Evaluates on the same held-out test split main.py uses
+(prepare_dataset + train_test_split at config.train_test_split, config.seed).
 
 Outputs (in mi_outputs/logit_lens/, or mi_outputs/logit_lens_test/ for --dataset test):
     gaps_<variant>.csv                # per sample, per layer: logit(True) - logit(False)
@@ -16,6 +19,7 @@ Outputs (in mi_outputs/logit_lens/, or mi_outputs/logit_lens_test/ for --dataset
 import argparse
 import gc
 import os
+import random
 
 import torch.nn as nn
 import numpy as np
@@ -27,7 +31,7 @@ import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 from config import config
-from utils import load_jsonl, build_prompt
+from utils import load_jsonl, prepare_dataset
 
 VARIANTS = ["resistant", "susceptible"]   # axis is base (no adapter) + these
 OUT_DIR = "mi_outputs/logit_lens"
@@ -45,29 +49,20 @@ def get_answer_token_ids(tokenizer):
     return true_ids[0], false_ids[0]
 
 
-def build_samples(tokenizer, records, n_samples):
-    """One input per record: the Hasty Generalization argument (hasty[0],
-    reproducible). Records with no Hasty Generalization are skipped. Every
-    variant sees this identical input set."""
+def build_samples(tokenizer, test_ds):
+    """One input per row of the held-out TEST split: the same prompt main.py's
+    prepare_dataset produced, so the lens sees exactly the inputs the models
+    were trained/evaluated on. Every variant sees this identical input set."""
     samples = []
-    for rec in records:
-        hasty = rec.get("adv", {}).get("Hasty Generalization") or []
-        if not hasty:
-            continue
-        q, s = rec["question"], rec["source"]
-        ctx = hasty[0]
-
+    for prompt in test_ds["prompt"]:
         text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": build_prompt(q, s, ctx)}],
+            [{"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,   # hidden state here predicts the answer
         )
         enc = tokenizer(text, truncation=True, max_length=config.max_seq_length,
                         return_tensors="pt")
         samples.append((enc["input_ids"], enc["attention_mask"]))
-
-        if len(samples) >= n_samples:
-            break
     return samples
 
 
@@ -197,11 +192,11 @@ def plot(results):
 def main():
     global OUT_DIR
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-samples", type=int, default=64,
-                        help="Total number of prompts (one Hasty input per record)")
     parser.add_argument("--dataset", choices=["train", "test"], default="train",
                         help="Input file: 'train' = Boolq.jsonl (default); "
                              "'test' = DS_Boolq.jsonl (regenerated fallacy examples)")
+    parser.add_argument("--seed", type=int, default=config.seed,
+                        help="Seed for the train/test split (matches main.py by default)")
     args = parser.parse_args()
 
     # Route outputs to a separate folder for the test set so runs don't overwrite each other.
@@ -223,8 +218,21 @@ def main():
     true_id, false_id = get_answer_token_ids(tokenizer)
     print(f"Answer token ids: True={true_id}, False={false_id}")
 
-    samples = build_samples(tokenizer, records, args.num_samples)
-    print(f"Samples: {len(samples)} (one Hasty input per record)")
+    # Use the SAME held-out test split main.py trains/evaluates against:
+    # identical prepare_dataset + train_test_split (same size, seed, stratify).
+    random.seed(args.seed)
+    dataset = prepare_dataset(records, flip_labels=False)
+    split = dataset.train_test_split(
+        test_size=config.train_test_split,
+        seed=args.seed,
+        stratify_by_column="label",
+    )
+    test_ds = split["test"]
+    print(f"  Train: {len(split['train'])} | Test: {len(test_ds)} "
+          f"(test_size={config.train_test_split}, seed={args.seed})")
+
+    samples = build_samples(tokenizer, test_ds)
+    print(f"Samples: {len(samples)} (held-out test split)")
 
     try:  # transformers 5.x
         base = AutoModelForCausalLM.from_pretrained(
