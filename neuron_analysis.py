@@ -258,14 +258,15 @@ def _zero_out(_mod, _inp, out, idx):
 def save_results(results, top_k):
     os.makedirs(OUT_DIR, exist_ok=True)
     for variant, res in results.items():
-        if res is None:
-            continue
+        if res is None or not isinstance(res, tuple):
+            continue   # skip the "ablation" dict (handled separately below)
         corr, topk, sh_top, sh_diff = res
         H = corr.shape[1]
+        L = corr.shape[0]
+        layer_col = np.repeat(np.arange(L), H)      # layer repeated for each head
+        idx_col = np.tile(np.arange(H), L)          # 0..H-1 tiled per layer
         np.savetxt(os.path.join(OUT_DIR, f"neuron_rank_{variant}.csv"),
-                   np.c_[np.arange(corr.shape[0])[:, None],
-                         np.arange(H)[None, :],
-                         corr.ravel()].reshape(-1, 3),
+                   np.c_[layer_col, idx_col, corr.ravel()],
                    delimiter=",", header="layer,idx,abs_corr", comments="")
         if sh_top is not None:
             np.savetxt(os.path.join(OUT_DIR, f"shift_set_{variant}.csv"),
