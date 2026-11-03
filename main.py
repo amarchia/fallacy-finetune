@@ -130,6 +130,10 @@ def train_model(dataset, run_name, output_dir):
         for i, plen in enumerate(prompt_lengths):
             labels[i, :plen] = -100
 
+        # Mask right-padding positions (pad_token_id) out of the loss
+        pad_mask = tokenized_full["attention_mask"] == 0
+        labels[pad_mask] = -100
+
         return {
             "input_ids": tokenized_full["input_ids"],
             "attention_mask": tokenized_full["attention_mask"],

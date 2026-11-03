@@ -203,7 +203,7 @@ def ablate_neurons(model, samples, neuron_list, true_id, false_id, device):
         clean[s] = (out.logits[0, -1, true_id] - out.logits[0, -1, false_id]).float().item()
 
     # per-neuron zero ablation
-    for li, idx in neuron_list:
+    for k, (li, idx) in enumerate(neuron_list):
         effects = np.zeros(n, dtype=np.float32)
         for s, (input_ids, attention_mask, _lab) in enumerate(samples):
             def zero_hook(_mod, _inp, out):
@@ -220,10 +220,10 @@ def ablate_neurons(model, samples, neuron_list, true_id, false_id, device):
             finally:
                 h.remove()
             effects[s] = gap - clean[s]
-        dmean[li] = effects.mean()
-        dstd[li] = effects.std()
-        if (li % 25) == 0:
-            print(f"  ablated {li+1}/{len(neuron_list)} neurons")
+        dmean[k] = effects.mean()
+        dstd[k] = effects.std()
+        if (k % 25) == 0:
+            print(f"  ablated {k+1}/{len(neuron_list)} neurons")
 
     # joint: zero all top-k at once
     effects = np.zeros(n, dtype=np.float32)
@@ -272,9 +272,12 @@ def save_results(results, top_k):
                        np.array(sh_top), delimiter=",",
                        header="layer,idx", comments="")
     ab = results.get("ablation", {})
-    for variant, (dmean, dstd, joint) in ab.items():
-        li_idx = [t for t in ab.get(f"topk_{variant}", [])]
-        rows = np.c_[np.array(li_idx, dtype=float), dmean, dstd]
+    for variant in VARIANTS:          # skip the "topk_<variant>" list keys in ab
+        if variant not in ab:
+            continue
+        dmean, dstd, joint = ab[variant]
+        li_idx = np.array(ab.get(f"topk_{variant}", []), dtype=float)   # (k, 2): layer, idx
+        rows = np.c_[li_idx, dmean, dstd]
         np.savetxt(os.path.join(OUT_DIR, f"ablation_effects_{variant}.csv"),
                    rows, delimiter=",", header="layer,idx,d_gap_mean,d_gap_std", comments="")
         print(f"  joint ablation {variant}: Δgap = {joint:+.3f}")
